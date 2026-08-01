@@ -9,9 +9,9 @@ const DEFAULT_STATE = {
   config: {
     upstreamBaseUrl: "https://api.openai.com/v1",
     upstreamApiKey: "",
-    defaultModel: "gpt-5.6",
+    defaultModel: "gpt-5.5",
     browserSession: {
-      defaultModel: "auto",
+      defaultModel: "gpt-5.5",
       requestTimeout: 120000,
       maxConcurrency: 1
     }
@@ -322,4 +322,3 @@ function messagePreview(message) {
 
   return "";
 }
-

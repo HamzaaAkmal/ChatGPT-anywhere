@@ -63,16 +63,11 @@ window.fetch = async function (...args) {
       tokenFetchedAt = Date.now();
     }
     
-    // Capture important sentinel and device headers
-    const headersToCapture = [
-      "oai-device-id",
-      "oai-language",
-      "openai-sentinel-chat-requirements-token",
-      "openai-sentinel-proof-token"
-    ];
-    
-    headersToCapture.forEach(key => {
-      if (headersObj[key]) capturedHeaders[key] = headersObj[key];
+    // Capture important sentinel and device headers dynamically
+    Object.keys(headersObj).forEach(key => {
+      if (key.startsWith("oai-") || key.startsWith("openai-") || key === "chat-requirements") {
+        capturedHeaders[key] = headersObj[key];
+      }
     });
   }
 
@@ -120,6 +115,10 @@ window.addEventListener("message", async (event) => {
     }, "*");
     return;
   }
+
+  let previousText = "";
+  let activeMessageId = null;
+  let activeConversationId = null;
 
   try {
     // Only include user/system/assistant messages in the ChatGPT payload.
@@ -181,16 +180,18 @@ window.addEventListener("message", async (event) => {
         detail = await response.text();
       } catch {}
       const truncated = detail.slice(0, 300);
-      throw new Error(`ChatGPT 403: ${truncated || response.statusText}`);
+      if (shouldUseUIFallback(response.status, truncated)) {
+        console.debug("[CGA] Backend API blocked; falling back to ChatGPT UI automation.");
+        await submitPromptViaUI();
+        return;
+      }
+      throw new Error(`ChatGPT ${response.status}: ${truncated || response.statusText}`);
     }
 
     // ── SSE stream parsing ────────────────────────────────────────────────────
     const reader = response.body.getReader();
     const decoder = new TextDecoder("utf-8");
 
-    let previousText = "";
-    let activeMessageId = null;
-    let activeConversationId = null;
     let lineBuffer = "";
 
     while (true) {
@@ -232,25 +233,37 @@ window.addEventListener("message", async (event) => {
             activeConversationId = data.conversation_id;
           }
 
-          if (data.message) {
-            activeMessageId = data.message.id || activeMessageId;
+          const message = data.message || data.v?.message;
+          if (message) {
+            if (message.author?.role && message.author.role !== "assistant") continue;
 
-            const parts = data.message.content?.parts;
-            if (Array.isArray(parts) && parts.length > 0) {
-              const currentText = parts[0];
-              if (typeof currentText === "string" && currentText.length > previousText.length) {
-                const delta = currentText.slice(previousText.length);
-                previousText = currentText;
+            activeMessageId = message.id || activeMessageId;
+            emitTextDelta(extractMessageText(message));
+          }
 
-                window.postMessage({
-                  type: "CGA_STREAM_CHUNK",
-                  requestId,
-                  delta,
-                  messageId: activeMessageId,
-                  conversationId: activeConversationId,
-                  source: "chatgpt-anywhere-main"
-                }, "*");
-              }
+          for (const patch of extractStreamPatches(data)) {
+            if (patch.p === "/conversation_id" && typeof patch.v === "string") {
+              activeConversationId = patch.v;
+              continue;
+            }
+
+            if (patch.p === "/message/id" && typeof patch.v === "string") {
+              activeMessageId = patch.v;
+              continue;
+            }
+
+            if (!patch.p?.startsWith("/message/content/parts/")) {
+              continue;
+            }
+
+            const value = textFromValue(patch.v);
+            if (!value) continue;
+
+            if (patch.o === "append") {
+              previousText += value;
+              emitChunk(value);
+            } else {
+              emitTextDelta(value);
             }
           }
         } catch (parseErr) {
@@ -289,5 +302,297 @@ window.addEventListener("message", async (event) => {
       error: error.message,
       source: "chatgpt-anywhere-main"
     }, "*");
+  }
+
+  function emitTextDelta(currentText) {
+    if (typeof currentText !== "string" || !currentText) return;
+
+    if (currentText.length > previousText.length && currentText.startsWith(previousText)) {
+      const delta = currentText.slice(previousText.length);
+      previousText = currentText;
+      emitChunk(delta);
+      return;
+    }
+
+    if (currentText !== previousText) {
+      previousText = currentText;
+      emitChunk(currentText);
+    }
+  }
+
+  function emitChunk(delta) {
+    if (!delta) return;
+
+    window.postMessage({
+      type: "CGA_STREAM_CHUNK",
+      requestId,
+      delta,
+      messageId: activeMessageId,
+      conversationId: activeConversationId,
+      source: "chatgpt-anywhere-main"
+    }, "*");
+  }
+
+  function emitDone() {
+    window.postMessage({
+      type: "CGA_STREAM_DONE",
+      requestId,
+      fullContent: previousText,
+      conversationId: activeConversationId,
+      messageId: activeMessageId,
+      source: "chatgpt-anywhere-main"
+    }, "*");
+  }
+
+  function shouldUseUIFallback(status, detail) {
+    return status === 403 ||
+      /unusual activity|sentinel|proof|challenge|arkose|captcha/i.test(detail || "");
+  }
+
+  async function submitPromptViaUI() {
+    const promptText = messagesToPrompt(body.messages || []);
+    if (!promptText) {
+      throw new Error("No prompt text available for ChatGPT UI fallback.");
+    }
+
+    await stopCurrentUIResponse();
+
+    const beforeTurnCount = getConversationTurns().length;
+    const composer = await waitForComposer(15000);
+
+    setComposerText(composer, promptText);
+    await delay(150);
+
+    const submitButton = await waitForEnabledSubmitButton(15000);
+    submitButton.click();
+
+    const startedAt = Date.now();
+    let lastObservedText = "";
+    let stableSince = Date.now();
+
+    while (Date.now() - startedAt < 120000) {
+      const assistantText = getLatestAssistantTurnText(beforeTurnCount, promptText);
+      if (assistantText && assistantText !== lastObservedText) {
+        emitTextDelta(assistantText);
+        lastObservedText = assistantText;
+        stableSince = Date.now();
+      }
+
+      if (lastObservedText && Date.now() - stableSince > 2500) {
+        emitDone();
+        return;
+      }
+
+      await delay(250);
+    }
+
+    throw new Error("Timed out waiting for ChatGPT UI response.");
+  }
+
+  async function stopCurrentUIResponse() {
+    const stopButton = document.querySelector('[data-testid="stop-button"], button[aria-label="Stop answering"]');
+    if (stopButton instanceof HTMLElement) {
+      stopButton.click();
+      await delay(500);
+    }
+  }
+
+  function messagesToPrompt(messages) {
+    const normalized = messages
+      .filter((message) => ["system", "user", "assistant"].includes(message?.role))
+      .map((message) => ({
+        role: message.role,
+        content: messageContentToText(message.content)
+      }))
+      .filter((message) => message.content);
+
+    if (normalized.length === 1 && normalized[0].role === "user") {
+      return normalized[0].content;
+    }
+
+    return normalized
+      .map((message) => `${message.role.toUpperCase()}:\n${message.content}`)
+      .join("\n\n");
+  }
+
+  function messageContentToText(content) {
+    if (typeof content === "string") return content;
+
+    if (Array.isArray(content)) {
+      return content
+        .map((part) => {
+          if (typeof part === "string") return part;
+          if (typeof part?.text === "string") return part.text;
+          if (typeof part?.content === "string") return part.content;
+          return "";
+        })
+        .filter(Boolean)
+        .join("\n");
+    }
+
+    return content ? JSON.stringify(content) : "";
+  }
+
+  function setComposerText(composer, text) {
+    composer.focus();
+
+    if (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement) {
+      composer.value = text;
+      composer.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        inputType: "insertText",
+        data: text
+      }));
+      return;
+    }
+
+    const selection = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(composer);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    document.execCommand("insertText", false, text);
+    composer.dispatchEvent(new InputEvent("input", {
+      bubbles: true,
+      inputType: "insertText",
+      data: text
+    }));
+  }
+
+  async function waitForEnabledSubmitButton(timeoutMs) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      const button = document.querySelector(
+        '#composer-submit-button:not([data-testid="stop-button"]), [data-testid="send-button"], button[aria-label="Send prompt"]'
+      );
+
+      if (button instanceof HTMLButtonElement && !button.disabled) {
+        return button;
+      }
+
+      await delay(100);
+    }
+
+    throw new Error("ChatGPT send button was not available.");
+  }
+
+  async function waitForComposer(timeoutMs) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      const editor = document.querySelector('#prompt-textarea[contenteditable="true"]');
+      if (editor instanceof HTMLElement) {
+        return editor;
+      }
+
+      const textarea = document.querySelector('textarea[aria-label="Chat with ChatGPT"]');
+      if (textarea instanceof HTMLElement) {
+        return textarea;
+      }
+
+      await delay(100);
+    }
+
+    throw new Error("Timed out waiting for ChatGPT composer.");
+  }
+
+  function getLatestAssistantTurnText(beforeTurnCount, promptText) {
+    const newTurns = getConversationTurns().slice(beforeTurnCount);
+    if (newTurns.length < 2) return "";
+
+    const latestTurn = newTurns[newTurns.length - 1];
+    const text = extractAssistantTurnText(latestTurn) ||
+      cleanTurnText(latestTurn.innerText || latestTurn.textContent || "");
+
+    return text === cleanTurnText(promptText) ? "" : text;
+  }
+
+  function extractAssistantTurnText(turn) {
+    const assistant = turn.querySelector('[data-message-author-role="assistant"]') || turn;
+    const writingBlock = assistant.querySelector(
+      '[data-writing-block] .ProseMirror.markdown, [data-writing-block] .mt4SwW_editor'
+    );
+    if (writingBlock instanceof HTMLElement) {
+      return cleanTurnText(writingBlock.innerText || writingBlock.textContent || "");
+    }
+
+    const markdown = assistant.querySelector(".markdown");
+    if (markdown instanceof HTMLElement) {
+      const clone = markdown.cloneNode(true);
+      clone.querySelectorAll([
+        ".sr-only",
+        "button",
+        '[role="button"]',
+        '[data-testid^="writing-block-header"]',
+        '[data-testid*="magic-edit"]'
+      ].join(",")).forEach((element) => element.remove());
+      return cleanTurnText(clone.innerText || clone.textContent || "");
+    }
+
+    return "";
+  }
+
+  function getConversationTurns() {
+    return Array.from(document.querySelectorAll('[data-testid^="conversation-turn-"]'));
+  }
+
+  function cleanTurnText(text) {
+    return String(text || "")
+      .replace(/\n+(Copy|Share|Good response|Bad response|Read aloud|Regenerate).*$/s, "")
+      .replace(/^(?:(?:Thinking|ChatGPT said:|Edit)\s*)+/g, "")
+      .replace(/\s+\n/g, "\n")
+      .trim();
+  }
+
+  function delay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function extractStreamPatches(data) {
+    if (Array.isArray(data)) {
+      return data.flatMap(extractStreamPatches);
+    }
+
+    if (!data || typeof data !== "object") {
+      return [];
+    }
+
+    const patches = [];
+    if (typeof data.o === "string" && typeof data.p === "string") {
+      patches.push(data);
+    }
+
+    for (const key of ["patches", "ops", "operations"]) {
+      if (Array.isArray(data[key])) {
+        patches.push(...data[key].flatMap(extractStreamPatches));
+      }
+    }
+
+    if (data.v && typeof data.v === "object") {
+      patches.push(...extractStreamPatches(data.v));
+    }
+
+    return patches;
+  }
+
+  function extractMessageText(message) {
+    const parts = message?.content?.parts;
+    if (Array.isArray(parts)) {
+      return parts.map(textFromValue).join("");
+    }
+
+    return textFromValue(message?.content?.text) ||
+      textFromValue(message?.content?.content) ||
+      textFromValue(message?.content);
+  }
+
+  function textFromValue(value) {
+    if (typeof value === "string") return value;
+    if (!value || typeof value !== "object") return "";
+
+    if (typeof value.text === "string") return value.text;
+    if (typeof value.content === "string") return value.content;
+    if (typeof value.value === "string") return value.value;
+
+    return "";
   }
 });

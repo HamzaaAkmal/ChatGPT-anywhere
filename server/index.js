@@ -281,7 +281,11 @@ async function forwardToExtension(req, res, body, local, config, client) {
 
     let isFinished = false;
     let fullContentBuffer = "";
-    let finalModel = body.model || "gpt-4o";
+    const requestedModel = body.model ||
+      config.browserSession?.defaultModel ||
+      config.defaultModel ||
+      "gpt-5.5";
+    let finalModel = requestedModel;
     const requestTimeout = config.browserSession?.requestTimeout || 120000;
 
     if (isStreaming) {
@@ -328,15 +332,23 @@ async function forwardToExtension(req, res, body, local, config, client) {
       }
 
       if (isStreaming && !res.writableEnded) {
-        // Send final chunk with finish_reason
-        const finalChunk = JSON.stringify({
-          id: `chatcmpl-${requestId.slice(0, 8)}`,
-          object: "chat.completion.chunk",
-          created: Math.floor(Date.now() / 1000),
-          model: finalModel,
-          choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
-        });
-        res.write(`data: ${finalChunk}\n\n`);
+        if (error) {
+          // Emit the error visibly in the stream
+          const errorChunk = JSON.stringify({
+            error: { message: String(error), type: "bridge_error" }
+          });
+          res.write(`data: ${errorChunk}\n\n`);
+        } else {
+          // Send final chunk with finish_reason only on clean completion
+          const finalChunk = JSON.stringify({
+            id: `chatcmpl-${requestId.slice(0, 8)}`,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: finalModel,
+            choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+          });
+          res.write(`data: ${finalChunk}\n\n`);
+        }
         res.write("data: [DONE]\n\n");
         res.end();
       }
@@ -416,7 +428,10 @@ async function forwardToExtension(req, res, body, local, config, client) {
       extensionConnection.send(JSON.stringify({
         type: "prompt",
         requestId,
-        body
+        body: {
+          ...body,
+          model: requestedModel
+        }
       }));
     } catch {
       onClose();
@@ -663,4 +678,3 @@ function setCors(req, res) {
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Authorization,Content-Type,X-Admin-Token,X-Chat-Id");
 }
-

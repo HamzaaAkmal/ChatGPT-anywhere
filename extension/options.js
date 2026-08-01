@@ -102,7 +102,7 @@ async function checkHealth() {
 async function loadConfig() {
   const config = await adminFetch("/admin/config");
   elements.upstreamBaseUrl.value = config.upstreamBaseUrl || "https://api.openai.com/v1";
-  elements.defaultModel.value = config.defaultModel || "gpt-5.6";
+  elements.defaultModel.value = config.defaultModel || "gpt-5.5";
   elements.apiKeyStatus.textContent = config.upstreamApiKey?.configured
     ? `Upstream key configured: ${config.upstreamApiKey.prefix}`
     : "No upstream API key configured.";
