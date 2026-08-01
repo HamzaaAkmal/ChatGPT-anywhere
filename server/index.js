@@ -535,6 +535,10 @@ async function buildUpstreamChatBody(body, local, config) {
 
   delete upstreamBody.chat_id;
   delete upstreamBody.conversation_id;
+  delete upstreamBody.new_chat;
+  delete upstreamBody.use_recent_chat;
+  delete upstreamBody.materialize_images;
+  delete upstreamBody.live_ui_stream;
   delete upstreamBody.append_context;
   delete upstreamBody.use_stored_context;
   delete upstreamBody.store_locally;
@@ -669,17 +673,25 @@ async function forwardJsonResponse(req, res, upstream) {
 }
 
 function getLocalRequestOptions(req, body) {
-  const chatId = req.headers["x-chat-id"] ||
+  const startsNewChat = shouldStartNewChat(body);
+  const explicitChatId = req.headers["x-chat-id"] ||
     body.chat_id ||
-    body.conversation_id ||
     body.cga?.chat_id ||
-    body.metadata?.chat_id ||
+    body.metadata?.chat_id;
+
+  const chatId = explicitChatId ||
+    (!startsNewChat ? body.conversation_id : null) ||
     `chat_${Date.now()}_${randomUUID().slice(0, 8)}`;
 
   return {
     chatId,
     appendContext: Boolean(body.append_context ?? body.use_stored_context ?? body.cga?.append_context)
   };
+}
+
+function shouldStartNewChat(body = {}) {
+  const value = body.new_chat ?? body.cga?.new_chat;
+  return value === true || value === 1 || value === "true" || value === "1";
 }
 
 async function requireClientKey(req, res) {

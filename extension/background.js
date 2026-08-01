@@ -61,7 +61,11 @@ async function connectWebSocket() {
 
       if (msg.type === "prompt") {
         // Server sends { type:"prompt", requestId, body }
-        const activePort = await getBestChatGPTPort();
+        let activeEntry = await getBestChatGPTEntry();
+        if (activeEntry && shouldStartNewChat(msg.body)) {
+          activeEntry = await openNewChatInTab(activeEntry) || activeEntry;
+        }
+        const activePort = activeEntry?.port || null;
 
         if (activePort) {
           activeRequests.set(msg.requestId, activePort);
@@ -70,7 +74,7 @@ async function connectWebSocket() {
             type: "CGA_SUBMIT_PROMPT",
             requestId: msg.requestId,
             body: msg.body,
-            conversationId: msg.body?.conversation_id
+            conversationId: shouldStartNewChat(msg.body) ? null : msg.body?.conversation_id
           });
         } else {
           sendToServer({
@@ -161,6 +165,7 @@ chrome.runtime.onConnect.addListener((port) => {
   if (!tabId) return;
 
   connectedPorts.set(tabId, {
+    tabId,
     port,
     lastSeenAt: Date.now(),
     lastSuccessAt: 0,
@@ -285,8 +290,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 async function getBestChatGPTPort() {
+  const entry = await getBestChatGPTEntry();
+  return entry?.port || null;
+}
+
+async function getBestChatGPTEntry() {
   const existingEntry = getBestConnectedEntry();
-  if (existingEntry?.port) return existingEntry.port;
+  if (existingEntry?.port) return existingEntry;
 
   return await openChatGPTTabAndWait();
 }
@@ -313,14 +323,31 @@ async function openChatGPTTabAndWait() {
     if (tab?.id) {
       preferredTabId = tab.id;
       updateState({ chatgptTabId: tab.id });
-      const entry = await waitForPort(tab.id, PORT_WAIT_MS);
-      return entry?.port || null;
+      return await waitForPort(tab.id, PORT_WAIT_MS);
     }
   } catch {
     // Fall through to no-port error.
   }
 
   return null;
+}
+
+async function openNewChatInTab(entry) {
+  if (!entry?.tabId) return null;
+
+  try {
+    preferredTabId = entry.tabId;
+    updateState({ chatgptTabId: entry.tabId });
+    await chrome.tabs.update(entry.tabId, {
+      url: "https://chatgpt.com/",
+      active: false
+    });
+    const freshEntry = await waitForFreshPort(entry.tabId, entry.port, PORT_WAIT_MS);
+    await delay(250);
+    return freshEntry || connectedPorts.get(entry.tabId) || entry;
+  } catch {
+    return connectedPorts.get(entry.tabId) || entry;
+  }
 }
 
 async function waitForPort(tabId, timeoutMs) {
@@ -332,6 +359,22 @@ async function waitForPort(tabId, timeoutMs) {
   }
 
   return null;
+}
+
+async function waitForFreshPort(tabId, previousPort, timeoutMs) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const entry = connectedPorts.get(tabId);
+    if (entry?.port && entry.port !== previousPort) return entry;
+    await delay(100);
+  }
+
+  return null;
+}
+
+function shouldStartNewChat(body = {}) {
+  const value = body.new_chat ?? body.cga?.new_chat;
+  return value === true || value === 1 || value === "true" || value === "1";
 }
 
 function delay(ms) {
