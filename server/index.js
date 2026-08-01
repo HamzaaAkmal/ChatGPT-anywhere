@@ -216,7 +216,23 @@ async function proxyChatCompletions(req, res, client) {
 
   if (extensionConnection && extensionConnection.isAlive) {
     return new Promise((resolve) => {
+      let clientClosedBeforeRun = false;
+      const markClientClosedBeforeRun = () => {
+        if (!res.writableEnded) {
+          clientClosedBeforeRun = true;
+        }
+      };
+      res.once("close", markClientClosedBeforeRun);
+      req.once("aborted", markClientClosedBeforeRun);
+
       requestQueue.push(async () => {
+        res.removeListener("close", markClientClosedBeforeRun);
+        req.removeListener("aborted", markClientClosedBeforeRun);
+        if (clientClosedBeforeRun) {
+          resolve();
+          return;
+        }
+
         await forwardToExtension(req, res, body, local, config, client);
         resolve();
       });
@@ -287,6 +303,14 @@ async function forwardToExtension(req, res, body, local, config, client) {
       "gpt-5.5";
     let finalModel = requestedModel;
     const requestTimeout = config.browserSession?.requestTimeout || 120000;
+    const onClientClose = () => {
+      if (isFinished || res.writableEnded) return;
+      sendCancelToExtension("Client disconnected.");
+      finish(null, { skipResponse: true, skipStore: true });
+    };
+
+    res.once("close", onClientClose);
+    req.once("aborted", onClientClose);
 
     if (isStreaming) {
       res.writeHead(200, {
@@ -313,14 +337,33 @@ async function forwardToExtension(req, res, body, local, config, client) {
       }
     }, requestTimeout);
 
-    function finish(error) {
+    function sendCancelToExtension(reason) {
+      try {
+        extensionConnection?.send(JSON.stringify({
+          type: "cancel",
+          requestId,
+          reason
+        }));
+      } catch {
+        // The extension may already be disconnected.
+      }
+    }
+
+    function finish(error, options = {}) {
       if (isFinished) return;
       isFinished = true;
       clearTimeout(timeout);
+      res.removeListener("close", onClientClose);
+      req.removeListener("aborted", onClientClose);
 
       if (extensionConnection) {
         extensionConnection.removeListener("message", onMessage);
         extensionConnection.removeListener("close", onClose);
+      }
+
+      if (options.skipResponse) {
+        resolve();
+        return;
       }
 
       if (error && !isStreaming && !res.writableEnded) {
@@ -353,16 +396,17 @@ async function forwardToExtension(req, res, body, local, config, client) {
         res.end();
       }
 
-      // Store chat turn
-      store.upsertChatTurn({
-        chatId: local.chatId,
-        requestMessages: body.messages || [],
-        responseMessage: { role: "assistant", content: fullContentBuffer },
-        model: finalModel,
-        completionId: `chatcmpl-${requestId.slice(0, 8)}`,
-        streamed: isStreaming,
-        usage: null
-      }).catch((err) => console.error("Failed to store chat turn:", err));
+      if (!options.skipStore) {
+        store.upsertChatTurn({
+          chatId: local.chatId,
+          requestMessages: body.messages || [],
+          responseMessage: { role: "assistant", content: fullContentBuffer },
+          model: finalModel,
+          completionId: `chatcmpl-${requestId.slice(0, 8)}`,
+          streamed: isStreaming,
+          usage: null
+        }).catch((err) => console.error("Failed to store chat turn:", err));
+      }
 
       resolve();
     }

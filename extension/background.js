@@ -4,6 +4,7 @@ let keepaliveTimer = null;
 let backoffDelay = 1000;
 let wsConnected = false;
 let connectedPorts = new Map();
+let activeRequests = new Map();
 let tokenAvailable = false;
 let chatgptTabId = null;
 
@@ -52,18 +53,16 @@ async function connectWebSocket() {
     }, 25000);
   };
 
-  ws.onmessage = (event) => {
+  ws.onmessage = async (event) => {
     try {
       const msg = JSON.parse(event.data);
 
       if (msg.type === "prompt") {
         // Server sends { type:"prompt", requestId, body }
-        let activePort = null;
-        for (const port of connectedPorts.values()) {
-          activePort = port;
-        }
+        const activePort = await getBestChatGPTPort();
 
         if (activePort) {
+          activeRequests.set(msg.requestId, activePort);
           chrome.alarms.create("cga-keepalive", { periodInMinutes: 0.4 });
           activePort.postMessage({
             type: "CGA_SUBMIT_PROMPT",
@@ -76,6 +75,16 @@ async function connectWebSocket() {
             type: "error",
             requestId: msg.requestId,
             error: "No active ChatGPT tab found. Open chatgpt.com and log in."
+          });
+        }
+      } else if (msg.type === "cancel") {
+        const activePort = activeRequests.get(msg.requestId) || await getBestChatGPTPort();
+        activeRequests.delete(msg.requestId);
+        if (activePort) {
+          activePort.postMessage({
+            type: "CGA_CANCEL_PROMPT",
+            requestId: msg.requestId,
+            reason: msg.reason
           });
         }
       }
@@ -131,13 +140,21 @@ chrome.runtime.onConnect.addListener((port) => {
   const tabId = port.sender?.tab?.id;
   if (!tabId) return;
 
-  connectedPorts.set(tabId, port);
+  connectedPorts.set(tabId, {
+    port,
+    lastSeenAt: Date.now()
+  });
   updateState({ chatgptTabId: tabId });
 
   // Ask content script for token status immediately
   port.postMessage({ type: "CGA_GET_STATUS" });
 
   port.onMessage.addListener((msg) => {
+    const entry = connectedPorts.get(tabId);
+    if (entry) {
+      entry.lastSeenAt = Date.now();
+    }
+
     if (msg.type === "CGA_STATUS") {
       updateState({ tokenAvailable: msg.hasToken });
     } else if (msg.type === "CGA_STREAM_CHUNK") {
@@ -147,6 +164,7 @@ chrome.runtime.onConnect.addListener((port) => {
         delta: msg.delta
       });
     } else if (msg.type === "CGA_STREAM_DONE") {
+      activeRequests.delete(msg.requestId);
       chrome.alarms.clear("cga-keepalive");
       sendToServer({
         type: "done",
@@ -156,6 +174,7 @@ chrome.runtime.onConnect.addListener((port) => {
         messageId: msg.messageId
       });
     } else if (msg.type === "CGA_STREAM_ERROR") {
+      activeRequests.delete(msg.requestId);
       chrome.alarms.clear("cga-keepalive");
       sendToServer({
         type: "error",
@@ -167,6 +186,11 @@ chrome.runtime.onConnect.addListener((port) => {
 
   port.onDisconnect.addListener(() => {
     connectedPorts.delete(tabId);
+    for (const [requestId, requestPort] of activeRequests) {
+      if (requestPort === port) {
+        activeRequests.delete(requestId);
+      }
+    }
     if (connectedPorts.size === 0) {
       updateState({ chatgptTabId: null, tokenAvailable: false });
     }
@@ -177,7 +201,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "GET_STATUS") {
     // Refresh token status from active tab
     if (chatgptTabId && connectedPorts.has(chatgptTabId)) {
-      connectedPorts.get(chatgptTabId).postMessage({ type: "CGA_GET_STATUS" });
+      connectedPorts.get(chatgptTabId).port.postMessage({ type: "CGA_GET_STATUS" });
     }
     sendResponse({ wsConnected, chatgptTabId, tokenAvailable });
   } else if (msg.type === "RECONNECT_WS") {
@@ -189,7 +213,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
   } else if (msg.type === "TEST_PROMPT") {
     if (connectedPorts.size > 0) {
-      const port = Array.from(connectedPorts.values()).pop();
+      const port = Array.from(connectedPorts.values())
+        .sort((a, b) => a.lastSeenAt - b.lastSeenAt)
+        .pop()
+        .port;
       const requestId = "test-" + Date.now();
       port.postMessage({
         type: "CGA_SUBMIT_PROMPT",
@@ -206,6 +233,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   return true;
 });
+
+async function getBestChatGPTPort() {
+  try {
+    const tabs = await chrome.tabs.query({
+      active: true,
+      currentWindow: true,
+      url: "https://chatgpt.com/*"
+    });
+    const activeTabId = tabs[0]?.id;
+    const activeEntry = activeTabId ? connectedPorts.get(activeTabId) : null;
+    if (activeEntry?.port) {
+      return activeEntry.port;
+    }
+  } catch {
+    // Fall through to most recently seen tab.
+  }
+
+  return Array.from(connectedPorts.values())
+    .sort((a, b) => a.lastSeenAt - b.lastSeenAt)
+    .pop()
+    ?.port || null;
+}
 
 // Connect on service worker startup
 connectWebSocket();
