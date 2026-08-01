@@ -497,7 +497,9 @@ window.addEventListener("message", async (event) => {
         lastObservedText,
         lastObservedImagesKey,
         lastTextChangedAt,
-        lastActiveAt
+        lastActiveAt,
+        startedAt,
+        isImagePrompt: isLikelyImagePrompt(promptText)
       })) {
         const finalImages = await hydrateImages(responseState.images, {
           includeData: body.cga?.materialize_images !== false && body.materialize_images !== false,
@@ -559,6 +561,8 @@ window.addEventListener("message", async (event) => {
           if (typeof part === "string") return part;
           if (typeof part?.text === "string") return part.text;
           if (typeof part?.content === "string") return part.content;
+          if (typeof part?.image_url?.url === "string") return "[Attached image]";
+          if (typeof part?.file?.filename === "string") return `[Attached file: ${part.file.filename}]`;
           return "";
         })
         .filter(Boolean)
@@ -638,10 +642,15 @@ window.addEventListener("message", async (event) => {
     const responseScope = getResponseScope(beforeTurnMarker, promptText);
     const newTurns = responseScope.turns;
     const assistantTurn = [...newTurns].reverse().find(isAssistantTurn);
-    const images = dedupeImages([
+    const scopedImages = dedupeImages([
       ...extractImageRefsFromTurns(newTurns),
       ...extractGeneratedImageRefsAfterElement(responseScope.promptTurn)
     ]);
+    const images = scopedImages.length
+      ? scopedImages
+      : (isLikelyImagePrompt(promptText) && responseScope.promptTurn
+        ? extractLatestGeneratedImageRefsFromPage(responseScope.promptTurn)
+        : []);
 
     if (!assistantTurn) {
       return {
@@ -674,6 +683,10 @@ window.addEventListener("message", async (event) => {
     const now = Date.now();
     if (responseState.images?.length && now - timing.lastTextChangedAt >= 2000) {
       return true;
+    }
+
+    if (timing.isImagePrompt && !responseState.images?.length && now - timing.startedAt < 45000) {
+      return false;
     }
 
     if (responseState.active) return false;
@@ -758,6 +771,19 @@ window.addEventListener("message", async (event) => {
       if (image) images.push(image);
     });
 
+    assistant.querySelectorAll("source[srcset]").forEach((source) => {
+      parseSrcset(source.getAttribute("srcset") || "").forEach((url) => {
+        const image = imageRefFromUrl(url, {
+          alt: source.getAttribute("aria-label") || "",
+          width: 0,
+          height: 0,
+          loaded: true,
+          force: true
+        });
+        if (image) images.push(image);
+      });
+    });
+
     assistant.querySelectorAll("a[href]").forEach((anchor) => {
       const href = normalizeImageUrl(anchor.href || anchor.getAttribute("href") || "");
       if (href && isLikelyImageUrl(href)) {
@@ -794,14 +820,48 @@ window.addEventListener("message", async (event) => {
       .flatMap((node) => Array.from(node.querySelectorAll("img")).map((img) => imageRefFromElement(img, true)))
       .filter(Boolean);
 
-    return dedupeImages([...imageRefs, ...labelledImageRefs]);
+    const linkedImageRefs = Array.from(root.querySelectorAll("a[href], source[srcset], [style]"))
+      .filter((node) => node instanceof HTMLElement)
+      .filter((node) => Boolean(element.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING))
+      .flatMap((node) => imageRefsFromGenericElement(node))
+      .filter(Boolean);
+
+    return dedupeImages([...imageRefs, ...labelledImageRefs, ...linkedImageRefs]);
+  }
+
+  function extractLatestGeneratedImageRefsFromPage(afterElement = null) {
+    const refs = [];
+
+    Array.from(document.images)
+      .filter((img) => !afterElement || Boolean(afterElement.compareDocumentPosition(img) & Node.DOCUMENT_POSITION_FOLLOWING))
+      .reverse()
+      .forEach((img) => {
+      const image = imageRefFromElement(img, true);
+      if (!image) return;
+
+      const descriptor = `${image.url} ${image.alt || ""}`.toLowerCase();
+      const largeEnough = Math.max(image.width || 0, image.height || 0) >= 160;
+      if (!largeEnough && !isLikelyImageUrl(image.url)) return;
+      if (/(avatar|profile|icon|logo|emoji|mobbin)/i.test(descriptor) && Math.max(image.width || 0, image.height || 0) < 512) return;
+
+      refs.push(image);
+    });
+
+    Array.from(document.querySelectorAll("a[href], source[srcset], [style]"))
+      .filter((element) => !afterElement || Boolean(afterElement.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING))
+      .reverse()
+      .forEach((element) => {
+        refs.push(...imageRefsFromGenericElement(element));
+      });
+
+    return dedupeImages(refs).slice(0, 4);
   }
 
   function imageRefFromElement(img, force = false) {
     if (!(img instanceof HTMLImageElement)) return null;
     if (!force && !isLikelyGeneratedImage(img)) return null;
 
-    const url = normalizeImageUrl(img.currentSrc || img.src || img.getAttribute("src") || "");
+    const url = normalizeImageUrl(img.currentSrc || img.src || img.getAttribute("src") || firstSrcsetUrl(img.getAttribute("srcset") || ""));
     if (!url) return null;
     if (force && url.startsWith("data:image/svg")) return null;
 
@@ -811,6 +871,58 @@ window.addEventListener("message", async (event) => {
       width: img.naturalWidth || img.clientWidth || 0,
       height: img.naturalHeight || img.clientHeight || 0,
       loaded: Boolean(img.complete && (img.naturalWidth || img.clientWidth))
+    };
+  }
+
+  function imageRefsFromGenericElement(element) {
+    const refs = [];
+
+    if (element instanceof HTMLAnchorElement) {
+      const image = imageRefFromUrl(element.href || element.getAttribute("href") || "", {
+        alt: cleanTurnText(element.innerText || element.textContent || ""),
+        loaded: true,
+        force: true
+      });
+      if (image) refs.push(image);
+    }
+
+    if (element instanceof HTMLSourceElement) {
+      parseSrcset(element.getAttribute("srcset") || "").forEach((url) => {
+        const image = imageRefFromUrl(url, {
+          alt: element.getAttribute("aria-label") || "",
+          loaded: true,
+          force: true
+        });
+        if (image) refs.push(image);
+      });
+    }
+
+    const style = element.getAttribute("style") || "";
+    const styleUrls = Array.from(style.matchAll(/url\((['"]?)(.*?)\1\)/g)).map((match) => match[2]);
+    styleUrls.forEach((url) => {
+      const image = imageRefFromUrl(url, {
+        alt: element.getAttribute("aria-label") || cleanTurnText(element.innerText || element.textContent || ""),
+        loaded: true,
+        force: true
+      });
+      if (image) refs.push(image);
+    });
+
+    return refs;
+  }
+
+  function imageRefFromUrl(url, options = {}) {
+    const normalizedUrl = normalizeImageUrl(url);
+    if (!normalizedUrl || normalizedUrl.startsWith("data:image/svg")) return null;
+    if (!options.force && !isLikelyImageUrl(normalizedUrl)) return null;
+    if (options.force && !isLikelyImageUrl(normalizedUrl)) return null;
+
+    return {
+      url: normalizedUrl,
+      alt: options.alt || "",
+      width: options.width || 0,
+      height: options.height || 0,
+      loaded: options.loaded !== false
     };
   }
 
@@ -884,7 +996,20 @@ window.addEventListener("message", async (event) => {
     return /^blob:https:\/\/chatgpt\.com\//i.test(url) ||
       /^data:image\//i.test(url) ||
       /\.(png|jpe?g|webp|gif)(?:[?#]|$)/i.test(url) ||
-      /(?:oaiusercontent|oaidalle|sdmntpr|openai|image-generation)/i.test(url);
+      /(?:oaiusercontent|oaidalle|sdmntpr|openai|image-generation|backend-api\/estuary\/content|\/estuary\/content|file_[a-z0-9]+)/i.test(url);
+  }
+
+  function parseSrcset(srcset) {
+    return String(srcset || "")
+      .split(",")
+      .map((candidate) => candidate.trim().split(/\s+/)[0])
+      .filter(Boolean)
+      .map(normalizeImageUrl)
+      .filter(Boolean);
+  }
+
+  function firstSrcsetUrl(srcset) {
+    return parseSrcset(srcset)[0] || "";
   }
 
   async function fetchImageAsDataUrl(url, options = {}) {
@@ -1047,6 +1172,17 @@ window.addEventListener("message", async (event) => {
       return {
         turns: turns.slice(promptIndex + 1),
         promptTurn: turns[promptIndex]
+      };
+    }
+
+    const latestUserIndex = findLastTurnIndex(turns, (turn, index) =>
+      index >= startIndex && isUserTurn(turn)
+    );
+
+    if (latestUserIndex >= 0) {
+      return {
+        turns: turns.slice(latestUserIndex + 1),
+        promptTurn: turns[latestUserIndex]
       };
     }
 

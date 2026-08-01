@@ -223,7 +223,7 @@ async function proxyChatCompletions(req, res, client) {
   const body = await readJson(req);
   const local = getLocalRequestOptions(req, body);
 
-  if (extensionConnection && extensionConnection.isAlive) {
+  if (extensionConnection && extensionConnection.isAlive && !shouldForceUpstream(body)) {
     return new Promise((resolve) => {
       let clientClosedBeforeRun = false;
       const markClientClosedBeforeRun = () => {
@@ -537,6 +537,8 @@ async function buildUpstreamChatBody(body, local, config) {
   delete upstreamBody.conversation_id;
   delete upstreamBody.new_chat;
   delete upstreamBody.use_recent_chat;
+  delete upstreamBody.force_upstream;
+  delete upstreamBody.prefer_upstream;
   delete upstreamBody.materialize_images;
   delete upstreamBody.live_ui_stream;
   delete upstreamBody.append_context;
@@ -691,6 +693,11 @@ function getLocalRequestOptions(req, body) {
 
 function shouldStartNewChat(body = {}) {
   const value = body.new_chat ?? body.cga?.new_chat;
+  return value === true || value === 1 || value === "true" || value === "1";
+}
+
+function shouldForceUpstream(body = {}) {
+  const value = body.force_upstream ?? body.prefer_upstream ?? body.cga?.force_upstream ?? body.cga?.prefer_upstream;
   return value === true || value === 1 || value === "true" || value === "1";
 }
 
@@ -1022,6 +1029,8 @@ function messageContentToText(content) {
       if (typeof part === "string") return part;
       if (typeof part?.text === "string") return part.text;
       if (typeof part?.content === "string") return part.content;
+      if (typeof part?.image_url?.url === "string") return "[Attached image]";
+      if (typeof part?.file?.filename === "string") return `[Attached file: ${part.file.filename}]`;
       return "";
     }).filter(Boolean).join("\n");
   }

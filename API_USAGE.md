@@ -59,6 +59,35 @@ Endpoint:
 POST /v1/chat/completions
 ```
 
+## Streamlit UI
+
+Install the Python UI dependencies:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+Run the local chat UI:
+
+```bash
+streamlit run streamlit_app.py
+```
+
+The UI supports:
+
+- Chatting through the local `/v1/chat/completions` API.
+- Streaming responses.
+- Plain, cleaned display that removes raw Markdown clutter while keeping code blocks readable.
+- Generated image rendering from returned `/v1/files/...` URLs.
+- Uploading images and files.
+- Optional direct upstream mode for lower latency when you configure your own provider API key.
+
+File upload behavior:
+
+- Text-like files, code files, CSV, JSON, Markdown, logs, and PDFs are converted to prompt text.
+- Images are sent as OpenAI-compatible `image_url` data URLs for direct upstream mode.
+- Browser mode can show image attachments in the prompt, but true image understanding needs direct upstream mode with a vision-capable model.
+
 ### Non-Streaming Example
 
 ```bash
@@ -176,6 +205,8 @@ curl -L "http://127.0.0.1:8787/v1/files/generated-file.png" -o image.png
 | `messages` | array | required | OpenAI-style messages. Supported roles: `system`, `user`, `assistant`. |
 | `stream` | boolean | `false` | When true, returns server-sent events using OpenAI chat completion chunk format. |
 | `new_chat` | boolean/string/number | `false` | When true, opens a fresh ChatGPT chat before sending the prompt. When false or omitted, uses the most recent connected ChatGPT chat. Accepts `true`, `1`, `"true"`, or `"1"`. |
+| `force_upstream` | boolean/string/number | `false` | When true, skips the browser extension and calls the configured upstream API directly. This is the safe low-latency path and requires an upstream API key. |
+| `prefer_upstream` | boolean/string/number | `false` | Alias for `force_upstream`. |
 | `conversation_id` | string | none | Advanced. Used by the direct ChatGPT backend path when available. Browser UI mode normally uses the currently loaded ChatGPT tab instead. |
 | `chat_id` | string | generated | Local archive id for server-side chat history storage. |
 | `append_context` | boolean | `false` | Upstream fallback only. Appends stored local messages for the same `chat_id`. |
@@ -190,6 +221,8 @@ Place bridge-specific options inside `cga` if you want to avoid top-level custom
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | `cga.new_chat` | boolean/string/number | `false` | Same as top-level `new_chat`. |
+| `cga.force_upstream` | boolean/string/number | `false` | Same as top-level `force_upstream`. |
+| `cga.prefer_upstream` | boolean/string/number | `false` | Alias for `cga.force_upstream`. |
 | `cga.prefer_backend` | boolean | `false` | When true, tries the direct ChatGPT backend path before the UI path. |
 | `cga.live_ui_stream` | boolean | `true` | When true, streams visible UI text as it appears. Set false to buffer until final. |
 | `cga.materialize_images` | boolean | `true` | When true, attempts to save generated image bytes to local `/v1/files/...` URLs. |
