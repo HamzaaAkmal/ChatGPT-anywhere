@@ -1,0 +1,266 @@
+:root {
+  color-scheme: light;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #f4f6f4;
+  color: #202421;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 760px;
+  background:
+    linear-gradient(120deg, rgba(39, 119, 111, 0.14), rgba(184, 92, 61, 0.09) 48%, rgba(244, 246, 244, 0) 76%),
+    #f4f6f4;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+.layout {
+  display: grid;
+  min-height: 100vh;
+  grid-template-columns: 280px minmax(0, 1fr);
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  border-right: 1px solid #d7ded8;
+  padding: 28px;
+}
+
+.content {
+  display: grid;
+  align-content: start;
+  gap: 18px;
+  padding: 28px;
+}
+
+.panel {
+  display: grid;
+  gap: 16px;
+  border: 1px solid #d7ded8;
+  border-radius: 8px;
+  padding: 18px;
+  background: rgba(255, 255, 255, 0.92);
+}
+
+.panel-header {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.grid {
+  display: grid;
+  gap: 14px;
+}
+
+.grid.two {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.grid.three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.status-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border: 1px solid #d7ded8;
+  border-left: 4px solid #d7ded8;
+  border-radius: 8px;
+  padding: 12px;
+  background: #ffffff;
+}
+
+.status-card.card-ok {
+  border-left-color: #1c6647;
+}
+
+.status-card.card-bad {
+  border-left-color: #973d2d;
+}
+
+.status-card-label {
+  color: #64706a;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.status-card-value {
+  color: #202421;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.inline-action {
+  display: grid;
+  grid-template-columns: 190px auto;
+  gap: 8px;
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
+
+h1 {
+  font-size: 28px;
+  line-height: 1.05;
+  letter-spacing: 0;
+}
+
+h2 {
+  font-size: 18px;
+  line-height: 1.2;
+  letter-spacing: 0;
+}
+
+.eyebrow {
+  margin-bottom: 5px;
+  color: #64706a;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.status,
+.hint,
+.empty,
+.meta {
+  color: #64706a;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+label {
+  display: grid;
+  gap: 7px;
+  color: #303631;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+input,
+textarea {
+  width: 100%;
+  border: 1px solid #d7ded8;
+  border-radius: 8px;
+  padding: 11px 12px;
+  background: #ffffff;
+  color: #202421;
+  outline: none;
+}
+
+textarea {
+  min-height: 84px;
+  resize: vertical;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+}
+
+input:focus,
+textarea:focus {
+  border-color: #27776f;
+  box-shadow: 0 0 0 3px rgba(39, 119, 111, 0.18);
+}
+
+button {
+  min-height: 38px;
+  border: 1px solid #27776f;
+  border-radius: 8px;
+  padding: 0 14px;
+  background: #27776f;
+  color: white;
+  cursor: pointer;
+  font-weight: 800;
+}
+
+button:hover {
+  background: #285f54;
+}
+
+.list {
+  display: grid;
+  gap: 10px;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  border: 1px solid #e4ddd1;
+  border-radius: 8px;
+  padding: 12px;
+  background: #ffffff;
+}
+
+.title {
+  overflow: hidden;
+  font-size: 14px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.new-key {
+  display: grid;
+  gap: 10px;
+  border: 1px solid #e8a088;
+  border-radius: 8px;
+  padding: 12px;
+  background: #fff3ee;
+}
+
+.hidden {
+  display: none;
+}
+
+.danger {
+  border-color: #b85c3d;
+  background: #b85c3d;
+}
+
+.danger:hover {
+  background: #96492f;
+}
+
+@media (max-width: 820px) {
+  body {
+    min-width: 0;
+  }
+
+  .layout,
+  .grid.two,
+  .grid.three {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    border-right: 0;
+    border-bottom: 1px solid #d7ded8;
+  }
+
+  .panel-header {
+    display: grid;
+  }
+
+  .inline-action {
+    grid-template-columns: 1fr;
+  }
+}

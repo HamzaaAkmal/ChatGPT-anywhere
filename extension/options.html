@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ChatGPT Anywhere Options</title>
+    <link rel="stylesheet" href="options.css">
+  </head>
+  <body>
+    <main class="layout">
+      <aside class="sidebar">
+        <p class="eyebrow">Control panel</p>
+        <h1>ChatGPT Anywhere</h1>
+        <p id="statusText" class="status">Waiting for server check</p>
+        <button id="refreshButton" type="button">Refresh</button>
+      </aside>
+
+      <section class="content">
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Primary</p>
+              <h2>Browser Session</h2>
+            </div>
+            <button id="refreshSessionButton" type="button">Refresh</button>
+          </div>
+          <div class="grid three">
+            <div class="status-card" id="wsCard">
+              <p class="status-card-label">Bridge Server</p>
+              <p class="status-card-value" id="wsStatus">—</p>
+            </div>
+            <div class="status-card" id="tabCard">
+              <p class="status-card-label">ChatGPT Tab</p>
+              <p class="status-card-value" id="tabStatus">—</p>
+            </div>
+            <div class="status-card" id="tokenCard">
+              <p class="status-card-label">Session Token</p>
+              <p class="status-card-value" id="tokenStatus">—</p>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Connection</p>
+              <h2>Server</h2>
+            </div>
+            <button id="saveConnectionButton" type="button">Save</button>
+          </div>
+          <div class="grid two">
+            <label>
+              Server URL
+              <input id="serverUrl" autocomplete="off" spellcheck="false">
+            </label>
+            <label>
+              Admin token
+              <input id="adminToken" type="password" autocomplete="off" spellcheck="false">
+            </label>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Upstream</p>
+              <h2>Upstream API (Fallback)</h2>
+            </div>
+            <button id="saveConfigButton" type="button">Save</button>
+          </div>
+          <div class="grid two">
+            <label>
+              Base URL
+              <input id="upstreamBaseUrl" autocomplete="off" spellcheck="false">
+            </label>
+            <label>
+              Default model
+              <input id="defaultModel" autocomplete="off" spellcheck="false">
+            </label>
+          </div>
+          <label>
+            Upstream API key
+            <input id="upstreamApiKey" type="password" autocomplete="off" spellcheck="false" placeholder="Leave blank to keep current key">
+          </label>
+          <p id="apiKeyStatus" class="hint"></p>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Local auth</p>
+              <h2>Client keys</h2>
+            </div>
+            <div class="inline-action">
+              <input id="keyName" autocomplete="off" spellcheck="false" placeholder="Key name">
+              <button id="createKeyButton" type="button">Generate</button>
+            </div>
+          </div>
+          <div id="newKeyBox" class="new-key hidden">
+            <label>
+              New key
+              <textarea id="newKey" readonly></textarea>
+            </label>
+            <button id="copyKeyButton" type="button">Copy key</button>
+          </div>
+          <div id="keys" class="list"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Local memory</p>
+              <h2>Recent chats</h2>
+            </div>
+          </div>
+          <div id="chats" class="list"></div>
+        </section>
+      </section>
+    </main>
+
+    <template id="emptyTemplate">
+      <p class="empty">Nothing here yet.</p>
+    </template>
+
+    <script src="options.js" type="module"></script>
+  </body>
+</html>

@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ChatGPT Anywhere</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Local wrapper</p>
+          <h1>ChatGPT Anywhere</h1>
+        </div>
+        <span id="statusPill" class="pill">Checking</span>
+      </header>
+
+      <section class="status-grid">
+        <div class="status-item">
+          <span class="status-dot" id="wsDot"></span>
+          <span>Bridge Server</span>
+        </div>
+        <div class="status-item">
+          <span class="status-dot" id="tabDot"></span>
+          <span>ChatGPT Tab</span>
+        </div>
+        <div class="status-item">
+          <span class="status-dot" id="tokenDot"></span>
+          <span>Session Token</span>
+        </div>
+      </section>
+
+      <section class="field-group">
+        <label for="serverUrl">Server URL</label>
+        <input id="serverUrl" name="serverUrl" autocomplete="off" spellcheck="false">
+      </section>
+
+      <section class="field-group">
+        <label for="adminToken">Admin token</label>
+        <input id="adminToken" name="adminToken" type="password" autocomplete="off" spellcheck="false">
+      </section>
+
+      <div class="actions">
+        <button id="saveButton" class="primary" type="button">Save</button>
+        <button id="checkButton" type="button">Check</button>
+        <button id="optionsButton" type="button">Options</button>
+        <button id="testButton" type="button">Test</button>
+      </div>
+
+      <section class="sample">
+        <div>
+          <p class="label">Endpoint</p>
+          <code id="endpoint">http://127.0.0.1:8787/v1/chat/completions</code>
+        </div>
+        <button id="copyButton" type="button">Copy</button>
+      </section>
+
+      <p id="message" class="message" role="status"></p>
+    </main>
+    <script src="popup.js" type="module"></script>
+  </body>
+</html>
