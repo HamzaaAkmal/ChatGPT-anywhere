@@ -1,5 +1,6 @@
 import http from "node:http";
 import path from "node:path";
+import { promises as fs } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { Store } from "./lib/store.js";
@@ -9,11 +10,13 @@ import { buildChatGPTRequest, parseSSEChunk, toOpenAIChunk, toOpenAIResponse } f
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
 const dataDir = path.join(rootDir, ".data");
+const filesDir = path.join(dataDir, "files");
 const host = process.env.HOST || "127.0.0.1";
 const port = Number(process.env.PORT || 8787);
 const store = new Store({ dataDir });
 
 await store.init();
+await fs.mkdir(filesDir, { recursive: true });
 
 if (process.env.OPENAI_API_KEY) {
   await store.patchConfig({ upstreamApiKey: process.env.OPENAI_API_KEY });
@@ -39,6 +42,7 @@ server.listen(port, host, () => {
 });
 
 let extensionConnection = null;
+const remoteImageSources = new Map();
 const wsServer = new WebSocketServer(server, { path: "/ws/extension" });
 
 wsServer.on("connection", (conn) => {
@@ -96,6 +100,11 @@ async function handleRequest(req, res) {
       extensionConnected: hasExt,
       mode
     });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname.startsWith("/v1/files/")) {
+    await serveLocalFile(req, res, url);
     return;
   }
 
@@ -297,12 +306,17 @@ async function forwardToExtension(req, res, body, local, config, client) {
 
     let isFinished = false;
     let fullContentBuffer = "";
+    let materializedImages = [];
+    const startedAtMs = Date.now();
     const requestedModel = body.model ||
       config.browserSession?.defaultModel ||
       config.defaultModel ||
       "gpt-5.5";
     let finalModel = requestedModel;
-    const requestTimeout = config.browserSession?.requestTimeout || 120000;
+    const requestTimeout = Math.max(
+      config.browserSession?.requestTimeout || 120000,
+      isLikelyImageRequest(body) ? 300000 : 0
+    );
     const onClientClose = () => {
       if (isFinished || res.writableEnded) return;
       sendCancelToExtension("Client disconnected.");
@@ -388,7 +402,14 @@ async function forwardToExtension(req, res, body, local, config, client) {
             object: "chat.completion.chunk",
             created: Math.floor(Date.now() / 1000),
             model: finalModel,
-            choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+            usage: estimateUsage(body.messages || [], fullContentBuffer),
+            time_taken_ms: Date.now() - startedAtMs,
+            images: materializedImages,
+            cga: {
+              full_content: fullContentBuffer,
+              usage_source: "estimated_browser_ui"
+            }
           });
           res.write(`data: ${finalChunk}\n\n`);
         }
@@ -404,7 +425,7 @@ async function forwardToExtension(req, res, body, local, config, client) {
           model: finalModel,
           completionId: `chatcmpl-${requestId.slice(0, 8)}`,
           streamed: isStreaming,
-          usage: null
+          usage: estimateUsage(body.messages || [], fullContentBuffer)
         }).catch((err) => console.error("Failed to store chat turn:", err));
       }
 
@@ -417,7 +438,7 @@ async function forwardToExtension(req, res, body, local, config, client) {
       }
     }
 
-    function onMessage(rawMsg) {
+    async function onMessage(rawMsg) {
       try {
         const msg = typeof rawMsg === "string" ? JSON.parse(rawMsg) : rawMsg;
         if (msg.requestId !== requestId) return;
@@ -437,9 +458,32 @@ async function forwardToExtension(req, res, body, local, config, client) {
             res.write(`data: ${chunk}\n\n`);
           }
         } else if (msg.type === "done") {
-          fullContentBuffer = msg.fullContent || fullContentBuffer;
+          materializedImages = await materializeBridgeImages(msg.images || [], req, {
+            bridgeTabId: msg.bridgeTabId
+          });
+          const finalContent = mergeContentAndImages(msg.fullContent || fullContentBuffer, materializedImages);
+          const imageContent = imageLines(materializedImages);
+          const finalDelta = finalContent.startsWith(fullContentBuffer)
+            ? finalContent.slice(fullContentBuffer.length)
+            : materializedImages.length
+              ? (fullContentBuffer ? `\n\n${imageContent}` : imageContent)
+              : (!fullContentBuffer ? finalContent : "");
+
+          if (isStreaming && finalDelta && !res.writableEnded) {
+            const chunk = JSON.stringify({
+              id: `chatcmpl-${requestId.slice(0, 8)}`,
+              object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000),
+              model: finalModel,
+              choices: [{ index: 0, delta: { content: finalDelta }, finish_reason: null }]
+            });
+            res.write(`data: ${chunk}\n\n`);
+          }
+
+          fullContentBuffer = finalContent || fullContentBuffer;
 
           if (!isStreaming && !res.writableEnded) {
+            const usage = estimateUsage(body.messages || [], fullContentBuffer);
             const response = {
               id: `chatcmpl-${requestId.slice(0, 8)}`,
               object: "chat.completion",
@@ -450,7 +494,10 @@ async function forwardToExtension(req, res, body, local, config, client) {
                 message: { role: "assistant", content: fullContentBuffer },
                 finish_reason: "stop"
               }],
-              usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+              usage,
+              time_taken_ms: Date.now() - startedAtMs,
+              usage_source: "estimated_browser_ui",
+              images: materializedImages
             };
             res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
             res.end(JSON.stringify(response, null, 2) + "\n");
@@ -721,4 +768,286 @@ function setCors(req, res) {
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Authorization,Content-Type,X-Admin-Token,X-Chat-Id");
+}
+
+async function serveLocalFile(req, res, url) {
+  setCors(req, res);
+
+  if (url.pathname.startsWith("/v1/files/remote/")) {
+    await serveRemoteImageProxy(req, res, url);
+    return;
+  }
+
+  const fileName = path.basename(decodeURIComponent(url.pathname.replace("/v1/files/", "")));
+  if (!/^[a-zA-Z0-9_.-]+$/.test(fileName)) {
+    sendJson(req, res, 400, {
+      error: { message: "Invalid file name", type: "invalid_request_error" }
+    });
+    return;
+  }
+
+  const filePath = path.join(filesDir, fileName);
+  try {
+    const data = await fs.readFile(filePath);
+    res.writeHead(200, {
+      "Content-Type": mimeTypeForFile(fileName),
+      "Cache-Control": "public, max-age=86400"
+    });
+    res.end(data);
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      sendJson(req, res, 404, {
+        error: { message: "File not found", type: "not_found" }
+      });
+      return;
+    }
+
+    throw error;
+  }
+}
+
+async function materializeBridgeImages(images, req, options = {}) {
+  const output = [];
+  const seen = new Set();
+
+  for (const image of Array.isArray(images) ? images : []) {
+    const sourceUrl = typeof image?.url === "string" ? image.url : "";
+    const key = sourceUrl || image?.dataUrl || randomUUID();
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    let url = sourceUrl;
+    let fileName = null;
+    const dataUrl = typeof image?.dataUrl === "string" ? image.dataUrl : "";
+    const parsed = parseDataUrl(dataUrl);
+
+    if (parsed) {
+      fileName = `${randomUUID()}${extensionForMimeType(parsed.mimeType)}`;
+      await fs.writeFile(path.join(filesDir, fileName), parsed.buffer);
+      url = `${getServerBaseUrl(req)}/v1/files/${fileName}`;
+    } else if (sourceUrl) {
+      const proxyId = randomUUID();
+      remoteImageSources.set(proxyId, {
+        sourceUrl,
+        bridgeTabId: options.bridgeTabId || null,
+        createdAt: Date.now()
+      });
+      url = `${getServerBaseUrl(req)}/v1/files/remote/${proxyId}`;
+    }
+
+    if (!url) continue;
+
+    output.push({
+      url,
+      source_url: sourceUrl || null,
+      file_name: fileName,
+      mime_type: parsed?.mimeType || image?.mimeType || mimeTypeForUrl(url),
+      width: Number(image?.width) || null,
+      height: Number(image?.height) || null,
+      alt: typeof image?.alt === "string" ? image.alt : ""
+    });
+  }
+
+  return output;
+}
+
+async function serveRemoteImageProxy(req, res, url) {
+  const proxyId = path.basename(decodeURIComponent(url.pathname.replace("/v1/files/remote/", "")));
+  const entry = remoteImageSources.get(proxyId);
+  if (!entry) {
+    sendJson(req, res, 404, {
+      error: { message: "Image proxy not found or server restarted", type: "not_found" }
+    });
+    return;
+  }
+
+  try {
+    const image = await fetchImageViaExtension(entry.sourceUrl, 25000, {
+      bridgeTabId: entry.bridgeTabId
+    });
+    const parsed = parseDataUrl(image.dataUrl);
+    if (!parsed) {
+      throw new Error("Extension returned invalid image data.");
+    }
+
+    res.writeHead(200, {
+      "Content-Type": parsed.mimeType,
+      "Cache-Control": "public, max-age=86400"
+    });
+    res.end(parsed.buffer);
+  } catch (error) {
+    sendJson(req, res, 502, {
+      error: {
+        message: error.message,
+        type: "image_proxy_error"
+      }
+    });
+  }
+}
+
+function fetchImageViaExtension(sourceUrl, timeoutMs, options = {}) {
+  if (!extensionConnection || !extensionConnection.isAlive) {
+    throw new Error("Extension is not connected.");
+  }
+
+  return new Promise((resolve, reject) => {
+    const requestId = randomUUID();
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error("Timed out fetching image through ChatGPT session."));
+    }, timeoutMs);
+
+    function cleanup() {
+      clearTimeout(timeout);
+      extensionConnection?.removeListener("message", onMessage);
+      extensionConnection?.removeListener("close", onClose);
+    }
+
+    function onClose() {
+      cleanup();
+      reject(new Error("Extension disconnected while fetching image."));
+    }
+
+    function onMessage(rawMsg) {
+      try {
+        const msg = typeof rawMsg === "string" ? JSON.parse(rawMsg) : rawMsg;
+        if (msg.requestId !== requestId) return;
+
+        cleanup();
+        if (msg.type === "image_fetch_done") {
+          resolve(msg.image || {});
+        } else if (msg.type === "image_fetch_error") {
+          reject(new Error(msg.error || "Image fetch failed."));
+        }
+      } catch {
+        // Ignore malformed messages.
+      }
+    }
+
+    extensionConnection.on("message", onMessage);
+    extensionConnection.on("close", onClose);
+
+    try {
+      extensionConnection.send(JSON.stringify({
+        type: "fetch_image",
+        requestId,
+        url: sourceUrl,
+        bridgeTabId: options.bridgeTabId,
+        timeoutMs: Math.max(1000, timeoutMs - 1000)
+      }));
+    } catch (error) {
+      cleanup();
+      reject(error);
+    }
+  });
+}
+
+function mergeContentAndImages(content, images) {
+  const cleanContent = String(content || "").trim();
+  if (!images?.length) return cleanContent;
+
+  const lines = imageLines(images)
+    .split("\n")
+    .filter((line) => line && !cleanContent.includes(line));
+
+  if (lines.length === 0) return cleanContent;
+  return cleanContent ? `${cleanContent}\n\n${lines.join("\n")}` : lines.join("\n");
+}
+
+function imageLines(images) {
+  return (images || [])
+    .map((image, index) => `Image ${index + 1}: ${image.url}`)
+    .join("\n");
+}
+
+function parseDataUrl(dataUrl) {
+  const match = String(dataUrl || "").match(/^data:([^;,]+)?(;base64)?,(.*)$/s);
+  if (!match || !match[2]) return null;
+
+  try {
+    return {
+      mimeType: match[1] || "application/octet-stream",
+      buffer: Buffer.from(match[3], "base64")
+    };
+  } catch {
+    return null;
+  }
+}
+
+function getServerBaseUrl(req) {
+  const forwardedProto = req.headers["x-forwarded-proto"];
+  const proto = Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto || "http";
+  return `${proto}://${req.headers.host || `${host}:${port}`}`;
+}
+
+function estimateUsage(messages, content) {
+  const promptText = (Array.isArray(messages) ? messages : [])
+    .map((message) => messageContentToText(message?.content))
+    .join("\n");
+  const promptTokens = estimateTokens(promptText);
+  const completionTokens = estimateTokens(content);
+
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: promptTokens + completionTokens
+  };
+}
+
+function estimateTokens(text) {
+  const normalized = String(text || "").trim();
+  if (!normalized) return 0;
+
+  const byChars = Math.ceil(normalized.length / 4);
+  const byWords = Math.ceil(normalized.split(/\s+/).length * 1.33);
+  return Math.max(1, byChars, byWords);
+}
+
+function messageContentToText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map((part) => {
+      if (typeof part === "string") return part;
+      if (typeof part?.text === "string") return part.text;
+      if (typeof part?.content === "string") return part.content;
+      return "";
+    }).filter(Boolean).join("\n");
+  }
+
+  return content ? JSON.stringify(content) : "";
+}
+
+function isLikelyImageRequest(body) {
+  const text = messageContentToText((body.messages || []).at?.(-1)?.content || "")
+    || (Array.isArray(body.messages) ? body.messages.map((message) => messageContentToText(message.content)).join("\n") : "");
+
+  return /\b(create|generate|make|draw|render|design)\b.{0,80}\b(image|picture|photo|illustration|art|wallpaper|poster|logo)\b/i
+    .test(text) ||
+    /\b(image|picture|photo|illustration|art|wallpaper|poster|logo)\b.{0,80}\b(of|for|showing|with)\b/i
+      .test(text);
+}
+
+function mimeTypeForFile(fileName) {
+  const ext = path.extname(fileName).toLowerCase();
+  if (ext === ".png") return "image/png";
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".webp") return "image/webp";
+  if (ext === ".gif") return "image/gif";
+  return "application/octet-stream";
+}
+
+function mimeTypeForUrl(url) {
+  try {
+    return mimeTypeForFile(new URL(url).pathname);
+  } catch {
+    return "application/octet-stream";
+  }
+}
+
+function extensionForMimeType(mimeType) {
+  const normalized = String(mimeType || "").toLowerCase();
+  if (normalized.includes("jpeg") || normalized.includes("jpg")) return ".jpg";
+  if (normalized.includes("webp")) return ".webp";
+  if (normalized.includes("gif")) return ".gif";
+  return ".png";
 }

@@ -5,8 +5,11 @@ window.__CGA_MAIN_INSTANCE_ID = CGA_INSTANCE_ID;
 let currentToken = null;
 let tokenFetchedAt = 0;
 let capturedHeaders = {};
-let backendBlockedUntil = 0;
-const BACKEND_BLOCK_CACHE_MS = 5 * 60 * 1000;
+let backendBlockedUntil = Number.MAX_SAFE_INTEGER;
+const BACKEND_BLOCK_CACHE_MS = 60 * 60 * 1000;
+const UI_RESPONSE_TIMEOUT_MS = 120000;
+const UI_IMAGE_RESPONSE_TIMEOUT_MS = 300000;
+const MAX_IMAGE_DATA_URL_LENGTH = 14_000_000;
 const activeAbortControllers = new Map();
 const cancelledRequestIds = new Set();
 
@@ -135,6 +138,35 @@ window.addEventListener("message", async (event) => {
     return;
   }
 
+  // ── Image fetch proxy ──
+  if (event.data?.type === "CGA_FETCH_IMAGE") {
+    const imageRequestId = event.data.requestId;
+    try {
+      const timeoutMs = Number(event.data.timeoutMs) || 18000;
+      const image = await fetchImageAsDataUrl(event.data.url, {
+        timeoutMs,
+        fetchTimeoutMs: Math.max(1000, timeoutMs - 500)
+      });
+      if (!image.dataUrl) {
+        throw new Error("Could not fetch image data from ChatGPT.");
+      }
+      window.postMessage({
+        type: "CGA_IMAGE_FETCH_DONE",
+        requestId: imageRequestId,
+        image,
+        source: "chatgpt-anywhere-main"
+      }, "*");
+    } catch (error) {
+      window.postMessage({
+        type: "CGA_IMAGE_FETCH_ERROR",
+        requestId: imageRequestId,
+        error: error.message,
+        source: "chatgpt-anywhere-main"
+      }, "*");
+    }
+    return;
+  }
+
   // ── Prompt submission ──
   if (event.data?.type !== "CGA_SUBMIT_PROMPT") return;
 
@@ -207,7 +239,7 @@ window.addEventListener("message", async (event) => {
       ...capturedHeaders
     };
 
-    if (Date.now() < backendBlockedUntil) {
+    if (shouldUseUIFirst(body)) {
       throwIfCancelled();
       await submitPromptViaUI();
       return;
@@ -392,15 +424,20 @@ window.addEventListener("message", async (event) => {
     emitDoneWithContent(previousText);
   }
 
-  function emitDoneWithContent(fullContent) {
+  function emitDoneWithContent(fullContent, images = []) {
     window.postMessage({
       type: "CGA_STREAM_DONE",
       requestId,
       fullContent,
+      images,
       conversationId: activeConversationId,
       messageId: activeMessageId,
       source: "chatgpt-anywhere-main"
     }, "*");
+  }
+
+  function shouldUseUIFirst(requestBody) {
+    return requestBody.cga?.prefer_backend !== true && Date.now() < backendBlockedUntil;
   }
 
   function shouldUseUIFallback(status, detail) {
@@ -426,18 +463,22 @@ window.addEventListener("message", async (event) => {
     submitButton.click();
 
     const startedAt = Date.now();
+    const timeoutMs = isLikelyImagePrompt(promptText) ? UI_IMAGE_RESPONSE_TIMEOUT_MS : UI_RESPONSE_TIMEOUT_MS;
     let lastObservedText = "";
+    let lastObservedImagesKey = "";
     let lastTextChangedAt = Date.now();
     let lastActiveAt = Date.now();
-    const emitLiveDeltas = Boolean(body.cga?.live_ui_stream || body.live_ui_stream);
+    const emitLiveDeltas = body.stream && body.cga?.live_ui_stream !== false &&
+      body.live_ui_stream !== false;
 
-    while (Date.now() - startedAt < 120000) {
+    while (Date.now() - startedAt < timeoutMs) {
       throwIfCancelled();
       const responseState = getUIResponseState(beforeTurnMarker, promptText);
       if (responseState.active) {
         lastActiveAt = Date.now();
       }
 
+      const imagesKey = imageStateKey(responseState.images);
       if (responseState.text && responseState.text !== lastObservedText) {
         lastObservedText = responseState.text;
         lastTextChangedAt = Date.now();
@@ -447,17 +488,29 @@ window.addEventListener("message", async (event) => {
         }
       }
 
+      if (imagesKey && imagesKey !== lastObservedImagesKey) {
+        lastObservedImagesKey = imagesKey;
+        lastTextChangedAt = Date.now();
+      }
+
       if (shouldFinishUIResponse(responseState, {
         lastObservedText,
+        lastObservedImagesKey,
         lastTextChangedAt,
         lastActiveAt
       })) {
+        const finalImages = await hydrateImages(responseState.images, {
+          includeData: body.cga?.materialize_images !== false && body.materialize_images !== false,
+          timeoutMs: 12000
+        });
+        const finalContent = buildAssistantContent(responseState.text || lastObservedText, []);
+
         if (!emitLiveDeltas) {
           previousText = "";
         }
 
-        emitTextDelta(lastObservedText);
-        emitDoneWithContent(lastObservedText);
+        emitTextDelta(finalContent);
+        emitDoneWithContent(finalContent, finalImages);
         return;
       }
 
@@ -582,12 +635,20 @@ window.addEventListener("message", async (event) => {
   }
 
   function getUIResponseState(beforeTurnMarker, promptText) {
-    const newTurns = getResponseCandidateTurns(beforeTurnMarker, promptText);
+    const responseScope = getResponseScope(beforeTurnMarker, promptText);
+    const newTurns = responseScope.turns;
     const assistantTurn = [...newTurns].reverse().find(isAssistantTurn);
+    const images = dedupeImages([
+      ...extractImageRefsFromTurns(newTurns),
+      ...extractGeneratedImageRefsAfterElement(responseScope.promptTurn)
+    ]);
+
     if (!assistantTurn) {
       return {
         text: "",
-        active: isChatGPTResponseActive(null)
+        images,
+        assistantTurn: null,
+        active: isChatGPTResponseActive(null) || areImagesStillLoading(images)
       };
     }
 
@@ -596,16 +657,28 @@ window.addEventListener("message", async (event) => {
 
     return {
       text: text === cleanTurnText(promptText) || isTransientAnswerText(text) ? "" : text,
-      active: isChatGPTResponseActive(assistantTurn)
+      images,
+      assistantTurn,
+      imageTurns: newTurns,
+      active: isChatGPTResponseActive(assistantTurn) || areImagesStillLoading(images)
     };
   }
 
+  function areImagesStillLoading(images) {
+    return images.length > 0 && !images.some((image) => image.loaded);
+  }
+
   function shouldFinishUIResponse(responseState, timing) {
-    if (!responseState.text || !timing.lastObservedText) return false;
-    if (responseState.active) return false;
+    if ((!responseState.text || !timing.lastObservedText) && !timing.lastObservedImagesKey) return false;
 
     const now = Date.now();
-    const quietMs = body.stream ? 350 : 220;
+    if (responseState.images?.length && now - timing.lastTextChangedAt >= 2000) {
+      return true;
+    }
+
+    if (responseState.active) return false;
+
+    const quietMs = responseState.images?.length ? 900 : body.stream ? 240 : 160;
     return now - timing.lastTextChangedAt >= quietMs &&
       now - timing.lastActiveAt >= 120;
   }
@@ -622,6 +695,13 @@ window.addEventListener("message", async (event) => {
 
   function isChatGPTResponseActive(assistantTurn) {
     if (document.querySelector('[data-testid="stop-button"], button[aria-label="Stop answering"]')) {
+      return true;
+    }
+
+    const turnText = assistantTurn
+      ? cleanTurnText(assistantTurn.innerText || assistantTurn.textContent || "")
+      : "";
+    if (turnText && isTransientAnswerText(turnText)) {
       return true;
     }
 
@@ -668,6 +748,271 @@ window.addEventListener("message", async (event) => {
     return "";
   }
 
+  function extractAssistantTurnImageRefs(turn) {
+    const assistant = turn?.querySelector?.('[data-message-author-role="assistant"]') || turn;
+    if (!(assistant instanceof HTMLElement)) return [];
+
+    const images = [];
+    assistant.querySelectorAll("img").forEach((img) => {
+      const image = imageRefFromElement(img);
+      if (image) images.push(image);
+    });
+
+    assistant.querySelectorAll("a[href]").forEach((anchor) => {
+      const href = normalizeImageUrl(anchor.href || anchor.getAttribute("href") || "");
+      if (href && isLikelyImageUrl(href)) {
+        images.push({
+          url: href,
+          alt: cleanTurnText(anchor.innerText || anchor.textContent || ""),
+          width: 0,
+          height: 0,
+          loaded: true
+        });
+      }
+    });
+
+    return dedupeImages(images);
+  }
+
+  function extractImageRefsFromTurns(turns) {
+    return dedupeImages((turns || []).flatMap((turn) => extractAssistantTurnImageRefs(turn)));
+  }
+
+  function extractGeneratedImageRefsAfterElement(element) {
+    if (!(element instanceof HTMLElement)) return [];
+
+    const root = document.body;
+    const imageRefs = Array.from(root.querySelectorAll("img"))
+      .filter((img) => Boolean(element.compareDocumentPosition(img) & Node.DOCUMENT_POSITION_FOLLOWING))
+      .map(imageRefFromElement)
+      .filter(Boolean);
+
+    const labelledImageRefs = Array.from(root.querySelectorAll('[aria-label*="Generated image" i], button'))
+      .filter((node) => node instanceof HTMLElement)
+      .filter((node) => Boolean(element.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING))
+      .filter((node) => /generated image/i.test(`${node.getAttribute("aria-label") || ""} ${node.innerText || node.textContent || ""}`))
+      .flatMap((node) => Array.from(node.querySelectorAll("img")).map((img) => imageRefFromElement(img, true)))
+      .filter(Boolean);
+
+    return dedupeImages([...imageRefs, ...labelledImageRefs]);
+  }
+
+  function imageRefFromElement(img, force = false) {
+    if (!(img instanceof HTMLImageElement)) return null;
+    if (!force && !isLikelyGeneratedImage(img)) return null;
+
+    const url = normalizeImageUrl(img.currentSrc || img.src || img.getAttribute("src") || "");
+    if (!url) return null;
+    if (force && url.startsWith("data:image/svg")) return null;
+
+    return {
+      url,
+      alt: img.alt || "",
+      width: img.naturalWidth || img.clientWidth || 0,
+      height: img.naturalHeight || img.clientHeight || 0,
+      loaded: Boolean(img.complete && (img.naturalWidth || img.clientWidth))
+    };
+  }
+
+  async function hydrateImages(images, options = {}) {
+    const uniqueImages = dedupeImages(images || []);
+    if (!options.includeData) return uniqueImages;
+
+    return Promise.all(uniqueImages.map(async (image) => {
+      const data = await fetchImageAsDataUrl(image.url, {
+        timeoutMs: options.timeoutMs || 6500,
+        fetchTimeoutMs: Math.max(1000, (options.timeoutMs || 6500) - 500)
+      });
+      return {
+        ...image,
+        ...data
+      };
+    }));
+  }
+
+  async function extractImagesFromTurns(turns, options = {}) {
+    const images = extractImageRefsFromTurns(turns);
+    if (!options.includeData) return images;
+
+    return Promise.all(images.map(async (image) => {
+      const data = await fetchImageAsDataUrl(image.url, {
+        timeoutMs: options.timeoutMs || 6500,
+        fetchTimeoutMs: Math.max(1000, (options.timeoutMs || 6500) - 500)
+      });
+      return {
+        ...image,
+        ...data
+      };
+    }));
+  }
+
+  async function extractAssistantTurnImages(turn, options = {}) {
+    const images = extractAssistantTurnImageRefs(turn);
+    if (!options.includeData) return images;
+
+    return Promise.all(images.map(async (image) => {
+      const data = await fetchImageAsDataUrl(image.url, {
+        timeoutMs: options.timeoutMs || 6500,
+        fetchTimeoutMs: Math.max(1000, (options.timeoutMs || 6500) - 500)
+      });
+      return {
+        ...image,
+        ...data
+      };
+    }));
+  }
+
+  function isLikelyGeneratedImage(img) {
+    const src = normalizeImageUrl(img.currentSrc || img.src || img.getAttribute("src") || "");
+    if (!src || src.startsWith("data:image/svg")) return false;
+
+    const alt = `${img.alt || ""} ${img.getAttribute("aria-label") || ""}`.toLowerCase();
+    const width = img.naturalWidth || img.clientWidth || 0;
+    const height = img.naturalHeight || img.clientHeight || 0;
+    const className = String(img.className || "").toLowerCase();
+
+    if (/(avatar|profile|icon|logo|emoji)/i.test(`${alt} ${className}`) && Math.max(width, height) < 160) {
+      return false;
+    }
+
+    return Math.max(width, height) >= 160 ||
+      isLikelyImageUrl(src) ||
+      /(generated|image|picture|photo|illustration)/i.test(alt);
+  }
+
+  function isLikelyImageUrl(url) {
+    return /^blob:https:\/\/chatgpt\.com\//i.test(url) ||
+      /^data:image\//i.test(url) ||
+      /\.(png|jpe?g|webp|gif)(?:[?#]|$)/i.test(url) ||
+      /(?:oaiusercontent|oaidalle|sdmntpr|openai|image-generation)/i.test(url);
+  }
+
+  async function fetchImageAsDataUrl(url, options = {}) {
+    return withTimeout(fetchImageAsDataUrlUnsafe(url, options), options.timeoutMs || 6500, {});
+  }
+
+  async function fetchImageAsDataUrlUnsafe(url, options = {}) {
+    if (!url) return {};
+
+    const canvasImage = imageElementToDataUrl(url);
+    if (canvasImage.dataUrl) return canvasImage;
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), options.fetchTimeoutMs || 6000);
+
+    try {
+      if (url.startsWith("data:image/")) {
+        return url.length <= MAX_IMAGE_DATA_URL_LENGTH ? {
+          dataUrl: url,
+          mimeType: dataUrlMimeType(url)
+        } : {};
+      }
+
+      const response = await originalFetch(url, {
+        headers: {
+          Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
+        },
+        credentials: "include",
+        signal: controller.signal
+      });
+      if (!response.ok) return {};
+
+      const blob = await response.blob();
+      const dataUrl = await blobToDataUrl(blob);
+      if (dataUrl.length > MAX_IMAGE_DATA_URL_LENGTH) return {};
+
+      return {
+        dataUrl,
+        mimeType: blob.type || dataUrlMimeType(dataUrl)
+      };
+    } catch {
+      return {};
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  function imageElementToDataUrl(url) {
+    try {
+      const normalizedUrl = normalizeImageUrl(url);
+      const img = Array.from(document.images).find((candidate) => {
+        const candidateUrl = normalizeImageUrl(candidate.currentSrc || candidate.src || candidate.getAttribute("src") || "");
+        return candidateUrl === normalizedUrl && candidate.complete &&
+          (candidate.naturalWidth || candidate.clientWidth) &&
+          (candidate.naturalHeight || candidate.clientHeight);
+      });
+      if (!img) return {};
+
+      const width = img.naturalWidth || img.clientWidth;
+      const height = img.naturalHeight || img.clientHeight;
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d");
+      if (!context) return {};
+
+      context.drawImage(img, 0, 0, width, height);
+      const dataUrl = canvas.toDataURL("image/png");
+      if (!dataUrl || dataUrl.length > MAX_IMAGE_DATA_URL_LENGTH) return {};
+
+      return {
+        dataUrl,
+        mimeType: "image/png",
+        width,
+        height
+      };
+    } catch {
+      return {};
+    }
+  }
+
+  function blobToDataUrl(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ""));
+      reader.onerror = () => reject(reader.error || new Error("Could not read generated image."));
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  function dataUrlMimeType(dataUrl) {
+    return String(dataUrl).match(/^data:([^;,]+)/)?.[1] || "application/octet-stream";
+  }
+
+  function normalizeImageUrl(url) {
+    try {
+      return new URL(String(url || ""), location.href).href;
+    } catch {
+      return "";
+    }
+  }
+
+  function dedupeImages(images) {
+    const seen = new Set();
+    return images.filter((image) => {
+      if (!image.url || seen.has(image.url)) return false;
+      seen.add(image.url);
+      return true;
+    });
+  }
+
+  function imageStateKey(images) {
+    return (images || [])
+      .map((image) => `${image.url}:${image.loaded ? 1 : 0}:${image.width}x${image.height}`)
+      .join("|");
+  }
+
+  function buildAssistantContent(text, images) {
+    const cleanText = cleanTurnText(text || "");
+    if (!images?.length) return cleanText;
+
+    const imageLines = images.map((image, index) =>
+      `Image ${index + 1}: ${image.url}`
+    ).join("\n");
+
+    return cleanText ? `${cleanText}\n\n${imageLines}` : imageLines;
+  }
+
   function extractCodeLanguage(pre) {
     const headerText = Array.from(pre.children)
       .map((element) => cleanTurnText(element.innerText || element.textContent || ""))
@@ -685,6 +1030,10 @@ window.addEventListener("message", async (event) => {
   }
 
   function getResponseCandidateTurns(beforeTurnMarker, promptText) {
+    return getResponseScope(beforeTurnMarker, promptText).turns;
+  }
+
+  function getResponseScope(beforeTurnMarker, promptText) {
     const turns = getConversationTurns();
     const markerIndex = beforeTurnMarker
       ? turns.findIndex((turn) => getTurnMarker(turn) === beforeTurnMarker)
@@ -695,10 +1044,16 @@ window.addEventListener("message", async (event) => {
     );
 
     if (promptIndex >= 0) {
-      return turns.slice(promptIndex + 1);
+      return {
+        turns: turns.slice(promptIndex + 1),
+        promptTurn: turns[promptIndex]
+      };
     }
 
-    return markerIndex >= 0 ? turns.slice(startIndex) : [];
+    return {
+      turns: markerIndex >= 0 ? turns.slice(startIndex) : [],
+      promptTurn: null
+    };
   }
 
   function findLastTurnIndex(turns, predicate) {
@@ -739,12 +1094,38 @@ window.addEventListener("message", async (event) => {
     const normalized = cleanTurnText(text).replace(/\s+/g, " ").trim();
     if (!normalized) return true;
 
+    const withoutImageProgress = normalized.replace(
+      /(Sketching it out|Making the first draft|Setting the scene|Polishing details|Adding final touches|One last tweak\.{0,3}|Finishing up|Generating image\.{0,3})/gi,
+      ""
+    ).trim();
+    if (!withoutImageProgress.replace(/[.\s]+/g, "")) return true;
+
     return /^(thinking|searching( the web)?|creating\b.{0,160}|working\b.{0,160}|writing\b.{0,160})$/i
       .test(normalized);
   }
 
   function normalizeComparableText(text) {
     return cleanTurnText(text).replace(/\s+/g, " ").trim();
+  }
+
+  function isLikelyImagePrompt(text) {
+    return /\b(create|generate|make|draw|render|design)\b.{0,80}\b(image|picture|photo|illustration|art|wallpaper|poster|logo)\b/i
+      .test(text || "") ||
+      /\b(image|picture|photo|illustration|art|wallpaper|poster|logo)\b.{0,80}\b(of|for|showing|with)\b/i
+        .test(text || "");
+  }
+
+  function withTimeout(promise, timeoutMs, fallbackValue) {
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => resolve(fallbackValue), timeoutMs);
+      promise.then((value) => {
+        clearTimeout(timeout);
+        resolve(value);
+      }).catch(() => {
+        clearTimeout(timeout);
+        resolve(fallbackValue);
+      });
+    });
   }
 
   function delay(ms) {
